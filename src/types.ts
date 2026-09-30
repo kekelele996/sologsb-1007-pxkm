@@ -30,6 +30,17 @@ export interface Tag {
   color: string;
 }
 
+export interface WordMark {
+  id: string;
+  /** 字符偏移起点（含），相对于片段 text */
+  start: number;
+  /** 字符偏移终点（不含） */
+  end: number;
+  /** 标记覆盖的原文，作为内容锚点；文字改动后按此重定位，而不是死贴偏移 */
+  text: string;
+  confidence: Confidence;
+}
+
 export interface Segment {
   id: string;
   start: number;
@@ -45,6 +56,14 @@ export interface Segment {
   };
   tagIds: string[];
   comments: ReviewComment[];
+  /**
+   * 词级置信标记。
+   * - 存在（数组可能为空）：已迁移到词级，整段置信度由标记派生（取最小值）。
+   * - 缺省（undefined）：旧稿片段，尚未回填，沿用整段置信度。
+   */
+  words?: WordMark[];
+  /** 整段文字被重新转录后，丢失内容锚点、等待重新标记的词级标记。 */
+  staleMarks?: WordMark[];
 }
 
 export interface TranscriptTrack {
@@ -68,7 +87,7 @@ export interface ProjectData {
 }
 
 export interface PersistedEnvelope {
-  schema: 1;
+  schema: 1 | 2;
   revision: number;
   tabId: string;
   savedAt: number;

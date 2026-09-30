@@ -1,27 +1,37 @@
 import { createSeedProject } from "./data";
+import { migrateProject, type MigrationFailure } from "./words";
 import type { PersistedEnvelope, ProjectData } from "./types";
 
 export const STORAGE_KEY = "sologsb-1007-project-v1";
 export const SESSION_KEY = "sologsb-1007-session";
 
-export function loadProject(): { project: ProjectData; revision: number } {
+export interface LoadedProject {
+  project: ProjectData;
+  revision: number;
+  /** 旧稿迁移到词级标记的结果；无迁移时为 null。 */
+  migration: { backfilled: number; failures: MigrationFailure[] } | null;
+}
+
+export function loadProject(): LoadedProject {
+  const seed = createSeedProject();
   if (typeof localStorage === "undefined") {
-    return { project: createSeedProject(), revision: 0 };
+    return { project: seed, revision: 0, migration: migrateProject(seed) };
   }
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as PersistedEnvelope;
-    if (parsed?.schema === 1 && parsed.project?.tracks?.length) {
-      return { project: parsed.project, revision: parsed.revision ?? 0 };
+    if ((parsed?.schema === 1 || parsed?.schema === 2) && parsed.project?.tracks?.length) {
+      const migration = migrateProject(parsed.project);
+      return { project: parsed.project, revision: parsed.revision ?? 0, migration };
     }
   } catch {
     // A malformed local draft falls back to the bundled sample.
   }
-  return { project: createSeedProject(), revision: 0 };
+  return { project: seed, revision: 0, migration: migrateProject(seed) };
 }
 
 export function saveProject(project: ProjectData, revision: number, tabId: string) {
   const envelope: PersistedEnvelope = {
-    schema: 1,
+    schema: 2,
     revision,
     tabId,
     savedAt: Date.now(),

@@ -14,7 +14,22 @@ import {
 } from "solid-js";
 import { createSeedProject, uid } from "../data";
 import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
-import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
+import {
+  buildAlignment,
+  mergeSegmentMarks,
+  mergeStaleMarks,
+  migrateTrack,
+  relocateMarks,
+  segmentConfidence,
+  splitSegmentMarks,
+  syncSegmentConfidence,
+  tokenize,
+  type AlignToken,
+  type Alignment,
+  type MigrationFailure,
+  type Token,
+} from "../words";
+import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack, WordMark } from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
 const TAB_ID = uid("tab");
@@ -23,6 +38,28 @@ function statusText(status: "saved" | "saving" | "offline") {
   if (status === "saving") return "正在保存";
   if (status === "offline") return "离线草稿";
   return "已自动保存";
+}
+
+function AlignTokenChip(props: {
+  token: AlignToken;
+  range: { start: number; end: number };
+  scale: number;
+  own?: boolean;
+  onJump?: () => void;
+}) {
+  const left = () => (props.token.timeStart - props.range.start) * props.scale;
+  const width = () => Math.max((props.token.timeEnd - props.token.timeStart) * props.scale, 28);
+  return (
+    <button
+      type="button"
+      class={`align-token ${props.token.aligned ? "aligned" : "mismatch"} ${props.own ? "own" : ""}`}
+      style={{ left: `${left()}px`, width: `${width()}px` }}
+      title={`${props.token.text} ${formatTime(props.token.timeStart, false)}–${formatTime(props.token.timeEnd, false)}${props.token.aligned ? "" : " · 在其他轨同时间位置无对应词"}`}
+      onClick={() => props.onJump?.()}
+    >
+      {props.token.text}
+    </button>
+  );
 }
 
 function parseTimedTranscript(input: string, trackName: string): TranscriptTrack {
@@ -115,6 +152,11 @@ export default function OralHistoryEditor() {
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
   const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
+  const [migrationInfo, setMigrationInfo] = createSignal<{ backfilled: number; failures: MigrationFailure[] } | null>(
+    loaded.migration && (loaded.migration.backfilled || loaded.migration.failures.length) ? loaded.migration : null,
+  );
+  const [showMigrationFailures, setShowMigrationFailures] = createSignal(false);
+  const [pickedWords, setPickedWords] = createSignal<Set<number>>(new Set<number>());
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
@@ -130,7 +172,9 @@ export default function OralHistoryEditor() {
   const visibleSegments = createMemo(() => {
     const segments = activeTrack()?.segments ?? [];
     if (trackFilter() === "unreviewed") return segments.filter((segment) => !segment.reviewed);
-    if (trackFilter() === "low") return segments.filter((segment) => segment.confidence <= 2 || segment.flags.lowConfidence);
+    if (trackFilter() === "low") {
+      return segments.filter((segment) => segmentConfidence(segment) <= 2 || segment.flags.lowConfidence);
+    }
     return segments;
   });
   const completedPercent = createMemo(() => {
@@ -138,6 +182,48 @@ export default function OralHistoryEditor() {
     if (!segments.length) return 0;
     return Math.round((segments.filter((segment) => segment.reviewed).length / segments.length) * 100);
   });
+  const wordStats = createMemo(() => {
+    let marked = 0;
+    let low = 0;
+    let staleSegments = 0;
+    for (const segment of project().tracks.flatMap((track) => track.segments)) {
+      for (const word of segment.words ?? []) {
+        marked += 1;
+        if (word.confidence <= 2) low += 1;
+      }
+      if (segment.staleMarks?.length) staleSegments += 1;
+    }
+    return { marked, low, staleSegments };
+  });
+  const wordTokens = createMemo((): Token[] => {
+    const segment = activeSegment();
+    return segment ? tokenize(segment.text) : [];
+  });
+  const alignment = createMemo((): Alignment => {
+    const segment = activeSegment();
+    if (!segment) return { mine: [], lanes: [] };
+    return buildAlignment(segment, project().tracks, project().activeTrackId);
+  });
+  const alignRange = createMemo(() => {
+    const { mine, lanes } = alignment();
+    if (!mine.length) return { start: 0, end: 1 };
+    let start = mine[0].timeStart;
+    let end = mine[mine.length - 1].timeEnd;
+    for (const lane of lanes) {
+      for (const token of lane.tokens) {
+        start = Math.min(start, token.timeStart);
+        end = Math.max(end, token.timeEnd);
+      }
+    }
+    return { start, end: Math.max(end, start + 1) };
+  });
+  const ALIGN_SCALE = 34; // 每秒像素数
+  const markCovering = (token: Token): WordMark | undefined => {
+    const segment = activeSegment();
+    return segment?.words?.find((word) => word.start <= token.start && word.end >= token.end);
+  };
+  const lowWordCount = (segment: Segment) =>
+    (segment.words ?? []).filter((word) => word.confidence <= 2).length;
   const speakerById = (speakerId: string) =>
     project().speakers.find((speaker) => speaker.id === speakerId) ?? project().speakers[0];
   const tagById = (tagId: string) => project().tags.find((tag) => tag.id === tagId);
@@ -199,6 +285,11 @@ export default function OralHistoryEditor() {
 
   const selectedIdSet = (id: string) => setSelectedId(id);
 
+  createEffect(() => {
+    selectedId();
+    setPickedWords(new Set<number>());
+  });
+
   const moveSelection = (direction: 1 | -1) => {
     const segments = activeTrack()?.segments ?? [];
     if (!segments.length) return;
@@ -219,21 +310,31 @@ export default function OralHistoryEditor() {
     const ratio = firstText.length / segment.text.length;
     const boundary = segment.start + (segment.end - segment.start) * ratio;
     const secondId = uid("seg");
+    const mapped = splitSegmentMarks(segment, safeCursor);
     commitSegment("拆分片段", (current, draft) => {
-      const original = structuredClone(current);
       current.text = firstText;
       current.end = Number(boundary.toFixed(1));
+      current.words = mapped.left;
+      current.staleMarks = mapped.leftStale;
+      syncSegmentConfidence(current);
       const trackIndex = draft.tracks.findIndex((track) => track.id === draft.activeTrackId);
       if (trackIndex >= 0) {
         const segmentIndex = draft.tracks[trackIndex].segments.findIndex((item) => item.id === current.id);
         draft.tracks[trackIndex].segments.splice(segmentIndex + 1, 0, {
-          ...original,
           id: secondId,
           start: Number(boundary.toFixed(1)),
+          end: segment.end,
+          speakerId: current.speakerId,
           text: secondText,
+          confidence: 3,
           reviewed: false,
+          flags: { ...current.flags },
+          tagIds: [...current.tagIds],
           comments: [],
+          words: mapped.right,
+          staleMarks: mapped.rightStale,
         });
+        syncSegmentConfidence(draft.tracks[trackIndex].segments[segmentIndex + 1]);
       }
       setSelectedId(secondId);
     });
@@ -246,12 +347,16 @@ export default function OralHistoryEditor() {
     const index = track.segments.findIndex((item) => item.id === segment.id);
     const next = track.segments[index + 1];
     if (!next) return;
+    const mergedWords = mergeSegmentMarks(segment, next);
+    const mergedStale = mergeStaleMarks(segment, next);
     commitSegment("合并下一片段", (current, draft) => {
       current.text = `${current.text.trim()} ${next.text.trim()}`;
       current.end = next.end;
       current.tagIds = [...new Set([...current.tagIds, ...next.tagIds])];
       current.comments.push(...next.comments);
-      current.confidence = Math.min(current.confidence, next.confidence) as Confidence;
+      current.words = mergedWords;
+      current.staleMarks = mergedStale;
+      syncSegmentConfidence(current);
       const sourceTrack = draft.tracks.find((item) => item.id === draft.activeTrackId);
       sourceTrack?.segments.splice(index + 1, 1);
       current.reviewed = false;
@@ -267,10 +372,99 @@ export default function OralHistoryEditor() {
 
   const setConfidence = (confidence: Confidence) => {
     commitSegment("校正置信度", (segment) => {
+      // 整段级别：若已有词级标记，同步把所有词设为该级别；否则作为无词级标记时的回退。
+      if (segment.words?.length) {
+        segment.words = segment.words.map((word) => ({ ...word, confidence }));
+      }
       segment.confidence = confidence;
       segment.flags.lowConfidence = confidence <= 2;
       segment.reviewed = false;
     });
+  };
+
+  const togglePickedWord = (token: Token) => {
+    setPickedWords((prev) => {
+      const next = new Set(prev);
+      if (next.has(token.start)) next.delete(token.start);
+      else next.add(token.start);
+      return next;
+    });
+  };
+
+  /** 把选中的字词（词表点选优先，其次文本框选区）标记为指定置信度。 */
+  const applyWordLevel = (confidence: Confidence) => {
+    const segment = activeSegment();
+    if (!segment) return;
+    const editor = editorRef;
+    const selectionStart = editor?.selectionStart ?? 0;
+    const selectionEnd = editor?.selectionEnd ?? 0;
+    const hasTextSelection = selectionStart !== selectionEnd;
+    const picked = pickedWords();
+    if (!picked.size && !hasTextSelection) {
+      setLastAction("请先在下方点选字词，或在转写文本框中选中文字");
+      return;
+    }
+    commitSegment("标记词级置信", (item) => {
+      let words = [...(item.words ?? [])];
+      if (picked.size) {
+        for (const start of picked) {
+          const token = tokenize(item.text).find((candidate) => candidate.start === start);
+          if (!token) continue;
+          words = words.filter((word) => !(word.start <= token.end && word.end >= token.start));
+          words.push({ id: uid("word"), start: token.start, end: token.end, text: token.text, confidence });
+        }
+      } else {
+        const start = Math.min(selectionStart, selectionEnd);
+        const end = Math.max(selectionStart, selectionEnd);
+        words = words.filter((word) => word.end <= start || word.start >= end);
+        words.push({ id: uid("word"), start, end, text: item.text.slice(start, end), confidence });
+      }
+      words.sort((a, b) => a.start - b.start);
+      item.words = words;
+      syncSegmentConfidence(item);
+      item.reviewed = false;
+    });
+    setPickedWords(new Set<number>());
+  };
+
+  const clearPickedMarks = () => {
+    const segment = activeSegment();
+    if (!segment) return;
+    const picked = pickedWords();
+    if (!picked.size) return;
+    commitSegment("清除词级标记", (item) => {
+      const tokens = tokenize(item.text);
+      item.words = (item.words ?? []).filter((word) => {
+        const coveredByPicked = tokens.some(
+          (token) => picked.has(token.start) && word.start <= token.start && word.end >= token.end,
+        );
+        return !coveredByPicked;
+      });
+      syncSegmentConfidence(item);
+      item.reviewed = false;
+    });
+    setPickedWords(new Set<number>());
+  };
+
+  const clearAllWordMarks = () => {
+    commitSegment("清空词级标记", (item) => {
+      item.words = [];
+      syncSegmentConfidence(item);
+      item.reviewed = false;
+    });
+    setPickedWords(new Set<number>());
+  };
+
+  const clearStaleMarks = () => {
+    commitSegment("清除失效标记", (item) => {
+      item.staleMarks = [];
+    });
+  };
+
+  const jumpToSegment = (trackId: string, segmentId: string) => {
+    if (trackId !== project().activeTrackId) switchTrack(trackId);
+    setSelectedId(segmentId);
+    document.getElementById(`segment-${segmentId}`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   };
 
   const addComment = () => {
@@ -340,6 +534,13 @@ export default function OralHistoryEditor() {
       draft.tracks.push(imported);
       draft.activeTrackId = imported.id;
       setSelectedId(imported.segments[0].id);
+      const result = migrateTrack(imported);
+      if (result.backfilled || result.failures.length) {
+        setMigrationInfo((prev) => ({
+          backfilled: (prev?.backfilled ?? 0) + result.backfilled,
+          failures: [...(prev?.failures ?? []), ...result.failures],
+        }));
+      }
     });
   };
 
@@ -403,7 +604,11 @@ export default function OralHistoryEditor() {
         mergeWithNext();
       } else if (event.key.toLowerCase() === "r" && activeSegment()) {
         event.preventDefault();
-        commitSegment("标记片段已校对", (segment) => { segment.reviewed = true; });
+        if (activeSegment()?.staleMarks?.length) {
+          setLastAction("存在失效词级标记，重新标记或清除后才能校对");
+        } else {
+          commitSegment("标记片段已校对", (segment) => { segment.reviewed = true; });
+        }
       } else if (event.key === "?" || (event.shiftKey && event.key === "/")) {
         event.preventDefault();
         setHelpOpen(true);
@@ -471,6 +676,40 @@ export default function OralHistoryEditor() {
         )}
       </Show>
 
+      <Show when={migrationInfo()}>
+        {(info) => (
+          <div class="migration-banner" role="status">
+            <div>
+              <strong>旧稿已迁移到词级置信标记</strong>
+              <span>
+                {info().backfilled} 个片段已按原级别把整段置信度回填到每个词
+                <Show when={info().failures.length}>，{info().failures.length} 个片段回填失败、保持原样</Show>
+                。
+              </span>
+              <Show when={showMigrationFailures()}>
+                <ul class="migration-failures">
+                  <For each={info().failures}>
+                    {(failure) => (
+                      <li>
+                        「{failure.trackName}」片段 {failure.segmentId}：{failure.reason}
+                      </li>
+                    )}
+                  </For>
+                </ul>
+              </Show>
+            </div>
+            <div class="conflict-actions">
+              <Show when={info().failures.length}>
+                <button class="btn btn-quiet" onClick={() => setShowMigrationFailures((value) => !value)}>
+                  {showMigrationFailures() ? "收起原因" : "查看原因"}
+                </button>
+              </Show>
+              <button class="btn btn-quiet" onClick={() => setMigrationInfo(null)}>知道了</button>
+            </div>
+          </div>
+        )}
+      </Show>
+
       <header class="topbar">
         <div class="brand-mark" aria-hidden="true"><span>口述</span><b>1007</b></div>
         <div class="project-heading">
@@ -503,7 +742,12 @@ export default function OralHistoryEditor() {
               <span>{project().tracks.flatMap((track) => track.segments).filter((segment) => segment.reviewed).length} / {project().tracks.flatMap((track) => track.segments).length} 片段</span>
             </div>
             <div class="progress-track"><i style={{ width: `${completedPercent()}%` }} /></div>
-            <p>修改会自动保存在本机；断网后仍可继续校对。</p>
+            <div class="word-stats">
+              <span>词级标记 <b>{wordStats().marked}</b> 处</span>
+              <span>低置信词 <b>{wordStats().low}</b> 个</span>
+              <span>失效片段 <b>{wordStats().staleSegments}</b> 段</span>
+            </div>
+            <p>改动词级标记会自动重算片段置信度与进度；修改自动保存在本机，断网后仍可继续校对。</p>
           </section>
 
           <section class="panel-section">
@@ -576,10 +820,12 @@ export default function OralHistoryEditor() {
                   <div class="segment-body">
                     <div class="segment-meta">
                       <b>{speakerById(segment.speakerId)?.name ?? "未知发言人"}</b>
-                      <span class={`confidence c${segment.confidence}`}>置信 {segment.confidence}/5</span>
+                      <span class={`confidence c${segmentConfidence(segment)}`}>置信 {segmentConfidence(segment)}/5</span>
+                      <Show when={lowWordCount(segment) > 0}><span class="pill alert">低置信词 {lowWordCount(segment)}</span></Show>
                       <Show when={segment.flags.lowConfidence}><span class="pill alert">低置信</span></Show>
                       <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
                       <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
+                      <Show when={segment.staleMarks?.length}><span class="pill alert">标记失效</span></Show>
                       <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
                     </div>
                     <p>{segment.text}</p>
@@ -606,13 +852,23 @@ export default function OralHistoryEditor() {
                 <Tabs.List class="tab-list">
                   <Tabs.Trigger value="correct">校对</Tabs.Trigger>
                   <Tabs.Trigger value="annotate">标注</Tabs.Trigger>
+                  <Tabs.Trigger value="align">对齐</Tabs.Trigger>
                   <Tabs.Trigger value="comments">批注 <span>{segment().comments.length}</span></Tabs.Trigger>
                 </Tabs.List>
 
                 <Tabs.Content value="correct" class="tab-content">
                   <div class="inspector-heading">
                     <div><span>片段 {activeTrack().segments.findIndex((item) => item.id === segment().id) + 1}</span><strong>{formatTime(segment().start, false)} — {formatTime(segment().end, false)}</strong></div>
-                    <button class={`review-button ${segment().reviewed ? "done" : ""}`} onClick={() => commitSegment("标记片段已校对", (item) => { item.reviewed = true; })}>
+                    <button
+                      class={`review-button ${segment().reviewed ? "done" : ""}`}
+                      onClick={() => {
+                        if (segment().staleMarks?.length) {
+                          setLastAction("存在失效词级标记，重新标记或清除后才能校对");
+                          return;
+                        }
+                        commitSegment("标记片段已校对", (item) => { item.reviewed = true; });
+                      }}
+                    >
                       {segment().reviewed ? "✓ 已校对" : "标记已校对"}
                     </button>
                   </div>
@@ -637,14 +893,82 @@ export default function OralHistoryEditor() {
                     ref={editorRef}
                     rows="7"
                     value={segment().text}
-                    onChange={(event) => commitSegment("校正转写文本", (item) => { item.text = event.currentTarget.value; item.reviewed = false; })}
+                    onChange={(event) => {
+                      const nextText = event.currentTarget.value;
+                      commitSegment("校正转写文本", (item) => {
+                        // 整段重新转录后，标记按内容锚点重定位；找不到原词的标记失效，绝不硬贴旧位置。
+                        const { kept, stale } = relocateMarks(nextText, item.words ?? []);
+                        item.words = kept;
+                        item.staleMarks = [...(item.staleMarks ?? []), ...stale];
+                        item.text = nextText;
+                        item.reviewed = false;
+                        syncSegmentConfidence(item);
+                      });
+                    }}
                   />
                   <div class="textarea-help">光标停在句中后点击“拆分”，系统会保留两侧时间码比例。</div>
 
-                  <div class="field-label">置信度</div>
-                  <div class="confidence-picker" role="radiogroup" aria-label="置信度">
+                  <Show when={segment().staleMarks?.length}>
+                    <div class="stale-banner" role="alert">
+                      <div>
+                        <strong>本段文字已重新转录，{segment().staleMarks?.length} 个词级标记失效</strong>
+                        <span>失效标记不会硬贴到新文字上，请重新点选字词标记，或清除后重标。</span>
+                      </div>
+                      <button class="btn btn-quiet" onClick={clearStaleMarks}>清除失效标记</button>
+                    </div>
+                    <div class="stale-chips">
+                      <For each={segment().staleMarks ?? []}>
+                        {(stale) => <span class={`stale-chip c${stale.confidence}`}>{stale.text} · 原置信 {stale.confidence}</span>}
+                      </For>
+                    </div>
+                  </Show>
+
+                  <div class="field-label">词级置信标记</div>
+                  <div class="word-editor">
+                    <div class="word-tokens" role="group" aria-label="词级标记">
+                      <For each={wordTokens()}>
+                        {(token) => {
+                          const mark = () => markCovering(token);
+                          const picked = () => pickedWords().has(token.start);
+                          return (
+                            <button
+                              type="button"
+                              class={[
+                                "word-token",
+                                mark() ? `marked c${mark()!.confidence}` : "",
+                                picked() ? "picked" : "",
+                              ].join(" ")}
+                              onClick={() => togglePickedWord(token)}
+                              title={mark() ? `置信 ${mark()!.confidence}/5，点击取消选中` : "点击选中该词"}
+                            >
+                              {token.text}
+                            </button>
+                          );
+                        }}
+                      </For>
+                      <Show when={!wordTokens().length}>
+                        <span class="word-empty">本段没有可标记的词。</span>
+                      </Show>
+                    </div>
+                    <div class="word-toolbar">
+                      <span class="word-toolbar-hint">
+                        {pickedWords().size ? `已选 ${pickedWords().size} 个词` : "点选字词，或在上方文本框中选中文字"}
+                      </span>
+                      <div class="word-levels" role="group" aria-label="词级置信度">
+                        <For each={[1, 2, 3, 4, 5] as Confidence[]}>
+                          {(value) => <button type="button" class={`level-btn c${value}`} onClick={() => applyWordLevel(value)}>{value}</button>}
+                        </For>
+                      </div>
+                      <button type="button" class="word-clear" disabled={!pickedWords().size} onClick={clearPickedMarks}>清除选中</button>
+                      <button type="button" class="word-clear-all" onClick={clearAllWordMarks}>清空本段</button>
+                    </div>
+                    <div class="textarea-help">词级标记取最小值决定整段置信度；拆分或合并片段时标记留在原字上，整段重录后标记自动失效。</div>
+                  </div>
+
+                  <div class="field-label">整段置信度</div>
+                  <div class="confidence-picker" role="radiogroup" aria-label="整段置信度">
                     <For each={[1, 2, 3, 4, 5] as Confidence[]}>
-                      {(value) => <button class={segment().confidence === value ? "active" : ""} onClick={() => setConfidence(value)}>{value}</button>}
+                      {(value) => <button class={segmentConfidence(segment()) === value ? "active" : ""} onClick={() => setConfidence(value)}>{value}</button>}
                     </For>
                   </div>
 
@@ -684,6 +1008,51 @@ export default function OralHistoryEditor() {
                       </button>
                     )}
                   </For>
+                </Tabs.Content>
+
+                <Tabs.Content value="align" class="tab-content">
+                  <div class="content-title">
+                    <h3>轨间词级对齐</h3>
+                    <p>方言轨与校订轨切分不同，按时间轴比例对齐同一段话的词；虚线红框表示该词在另一轨同时间位置找不到对应词。</p>
+                  </div>
+                  <Show
+                    when={alignment().lanes.length}
+                    fallback={<div class="mini-empty">其他轨道在本片段时间范围内没有对应片段。</div>}
+                  >
+                    <div class="align-view">
+                      <div class="align-lane">
+                        <div class="lane-label">
+                          <span class="lane-dot" style={{ background: speakerById(segment().speakerId)?.color ?? "#64748b" }} />
+                          {activeTrack().name} · 本段
+                        </div>
+                        <div class="lane-track">
+                          <For each={alignment().mine}>
+                            {(token) => <AlignTokenChip token={token} range={alignRange()} scale={ALIGN_SCALE} own />}
+                          </For>
+                        </div>
+                      </div>
+                      <For each={alignment().lanes}>
+                        {(lane) => (
+                          <div class="align-lane">
+                            <div class="lane-label">
+                              <span class="lane-dot" />
+                              {lane.trackName} · 片段 {(project().tracks.find((track) => track.id === lane.trackId)?.segments.findIndex((item) => item.id === lane.segmentId) ?? -1) + 1}
+                              <button class="lane-jump" onClick={() => jumpToSegment(lane.trackId, lane.segmentId)}>跳转</button>
+                            </div>
+                            <div class="lane-track">
+                              <For each={lane.tokens}>
+                                {(token) => <AlignTokenChip token={token} range={alignRange()} scale={ALIGN_SCALE} onJump={() => jumpToSegment(lane.trackId, lane.segmentId)} />}
+                              </For>
+                            </div>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                    <div class="align-legend">
+                      <span><i class="legend-swatch aligned" />时间轴对齐</span>
+                      <span><i class="legend-swatch mismatch" />对不上的词</span>
+                    </div>
+                  </Show>
                 </Tabs.Content>
 
                 <Tabs.Content value="comments" class="tab-content comments-content">
