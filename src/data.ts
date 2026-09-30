@@ -1,4 +1,4 @@
-import type { Confidence, ProjectData, Segment, Tag } from "./types";
+import type { Confidence, ProjectData, Segment, Tag, WordMark } from "./types";
 
 export const uid = (prefix = "id") =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -10,6 +10,19 @@ export const makeTag = (label: string, type: Tag["type"], color: string): Tag =>
   color,
 });
 
+/** 在文本中定位词串，生成词级标记；找不到时抛错，避免种子数据错位。 */
+const markAt = (text: string, snippet: string, confidence: Confidence, occurrence = 0): WordMark => {
+  let at = -1;
+  let from = 0;
+  for (let i = 0; i <= occurrence; i += 1) {
+    at = text.indexOf(snippet, from);
+    if (at < 0) break;
+    from = at + snippet.length;
+  }
+  if (at < 0) throw new Error(`种子词标记找不到“${snippet}”`);
+  return { start: at, end: at + snippet.length, confidence };
+};
+
 const segment = (
   id: string,
   start: number,
@@ -20,6 +33,7 @@ const segment = (
   flags: Partial<Segment["flags"]> = {},
   tagIds: string[] = [],
   reviewed = false,
+  wordMarks: WordMark[] = [],
 ): Segment => ({
   id,
   start,
@@ -34,6 +48,7 @@ const segment = (
     properNoun: false,
     ...flags,
   },
+  wordMarks,
   tagIds,
   comments: [],
 });
@@ -97,6 +112,11 @@ export const createSeedProject = (): ProjectData => {
             3,
             { dialect: true, properNoun: true },
             [byLabel("码头生活")],
+            false,
+            [
+              markAt("天没亮就有拖板车的声音，咯吱咯吱。那时大家讲“起水”，就是趁潮水把货卸下来。", "拖板车", 2),
+              markAt("天没亮就有拖板车的声音，咯吱咯吱。那时大家讲“起水”，就是趁潮水把货卸下来。", "咯吱咯吱", 2),
+            ],
           ),
           segment(
             "seg-3",
@@ -108,6 +128,10 @@ export const createSeedProject = (): ProjectData => {
             { lowConfidence: true, properNoun: true },
             [byLabel("家族迁徙"), byLabel("1938 年逃难"), byLabel("林有德")],
             true,
+            [
+              markAt("我爸爸叫林有德，他原来在宁绍帮的船上做账房，后来日本飞机来了，全家坐小船往闽江上游走。", "林有德", 3),
+              markAt("我爸爸叫林有德，他原来在宁绍帮的船上做账房，后来日本飞机来了，全家坐小船往闽江上游走。", "宁绍帮", 2),
+            ],
           ),
           segment(
             "seg-4",
@@ -128,6 +152,10 @@ export const createSeedProject = (): ProjectData => {
             3,
             { dialect: true, properNoun: true },
             [byLabel("民间戏曲"), byLabel("码头生活")],
+            false,
+            [
+              markAt("是咧。船上人讲的话我听得半懂，只记得他们会唱一种调子，后来才知道叫“甬剧”。", "甬剧", 2),
+            ],
           ),
           segment(
             "seg-6",
@@ -148,6 +176,10 @@ export const createSeedProject = (): ProjectData => {
             2,
             { lowConfidence: true, properNoun: true },
             [byLabel("林有德"), byLabel("码头生活")],
+            false,
+            [
+              markAt("我补充一下，林师傅当年还替街坊修过一台德国座钟，后来这台钟捐给了区文化馆。", "德国座钟", 2),
+            ],
           ),
           segment(
             "seg-8",
@@ -170,11 +202,17 @@ export const createSeedProject = (): ProjectData => {
           segment("fy-1", 16.4, 31.5, "sp-lin", "天未光就有拖车声，吱呀吱呀。彼时讲“起水”，趁潮水卸货。", 2, {
             dialect: true,
             lowConfidence: true,
-          }, [byLabel("码头生活")]),
+          }, [byLabel("码头生活")], false, [
+            markAt("天未光就有拖车声，吱呀吱呀。彼时讲“起水”，趁潮水卸货。", "拖车", 2),
+            markAt("天未光就有拖车声，吱呀吱呀。彼时讲“起水”，趁潮水卸货。", "吱呀吱呀", 2),
+          ]),
           segment("fy-2", 66.7, 84.1, "sp-lin", "是啦。船帮人讲的话我半听半猜，只记着伊侬唱调，后尾才知叫“甬剧”。", 3, {
             dialect: true,
             properNoun: true,
-          }, [byLabel("民间戏曲"), byLabel("码头生活")]),
+          }, [byLabel("民间戏曲"), byLabel("码头生活")], false, [
+            markAt("是啦。船帮人讲的话我半听半猜，只记着伊侬唱调，后尾才知叫“甬剧”。", "伊侬", 2),
+            markAt("是啦。船帮人讲的话我半听半猜，只记着伊侬唱调，后尾才知叫“甬剧”。", "甬剧", 2),
+          ]),
         ],
       },
       {

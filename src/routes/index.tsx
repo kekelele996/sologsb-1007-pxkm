@@ -14,10 +14,115 @@ import {
 } from "solid-js";
 import { createSeedProject, uid } from "../data";
 import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
-import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
+import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack, WordMark } from "../types";
+import {
+  alignSegmentWithTrack,
+  effectiveConfidence,
+  hasLowWord,
+  mergeWordMarks,
+  minWordConfidence,
+  normalizeMarks,
+  projectWordStats,
+  rebaseWordMarks,
+  splitWordMarks,
+  tokenize,
+} from "../word-marks";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
 const TAB_ID = uid("tab");
+const WORD_CONF_TITLES: Record<number, string> = {
+  1: "1 很不确定",
+  2: "2 不太确定",
+  3: "3 一般",
+  4: "4 比较确定",
+  5: "5 确定",
+};
+
+/** 跨轨对齐面板：方言轨/校订轨切分不一致时，词标记按时间轴配对，对不上的词高亮说明。 */
+function AlignmentPanel(props: { segment: Segment; tracks: TranscriptTrack[] }) {
+  const [targetId, setTargetId] = createSignal(props.tracks[0]?.id ?? "");
+  const targetTrack = createMemo(
+    () => props.tracks.find((track) => track.id === targetId()) ?? props.tracks[0] ?? null,
+  );
+  const rows = createMemo(() => {
+    const track = targetTrack();
+    return track ? alignSegmentWithTrack(props.segment, track) : [];
+  });
+  const mismatched = createMemo(() => rows().filter((row) => !row.aligned).length);
+
+  return (
+    <div class="alignment-panel">
+      <div class="content-title">
+        <h3>词级标记跨轨对齐</h3>
+        <p>各轨切分方式可能不同，这里不按文字或序号配对，而是把词标记映射到同一条时间轴上比对。</p>
+      </div>
+
+      <Show when={props.tracks.length} fallback={<div class="mini-empty">当前项目只有一条文本轨，没有可对齐的对象。</div>}>
+        <label class="field-label" for="align-track-select">对比轨道</label>
+        <select id="align-track-select" value={targetId()} onChange={(event) => setTargetId(event.currentTarget.value)}>
+          <For each={props.tracks}>{(track) => <option value={track.id}>{track.name} · {track.language}</option>}</For>
+        </select>
+
+        <Show
+          when={rows().length}
+          fallback={<div class="mini-empty">当前片段还没有词级标记。先在“校对”页选中听不准的字词进行标记。</div>}
+        >
+          <div class={`align-summary ${mismatched() ? "has-mismatch" : "all-aligned"}`}>
+            {mismatched()
+              ? `${mismatched()} / ${rows().length} 个词标记在《${targetTrack()?.name}》对不上`
+              : `${rows().length} 个词标记全部按时间轴对齐`}
+          </div>
+          <ul class="align-list">
+            <For each={rows()}>
+              {(row) => (
+                <li class={row.aligned ? "aligned" : "mismatched"}>
+                  <div class="align-word-row">
+                    <span class={`align-chip wc${row.word.mark.confidence}`}>{row.word.text}</span>
+                    <span class="align-time">{row.word.start.toFixed(1)}s–{row.word.end.toFixed(1)}s</span>
+                    <span class="align-status">{row.aligned ? "✓ 对齐" : "⚠ 对不上"}</span>
+                  </div>
+                  <p>{row.reason}</p>
+                </li>
+              )}
+            </For>
+          </ul>
+        </Show>
+      </Show>
+    </div>
+  );
+}
+
+/** 按词标记渲染片段正文，被标过的字词以置信度颜色高亮。 */
+function MarkedText(props: { text: string; marks: WordMark[] }) {
+  const pieces = createMemo(() => {
+    const marks = normalizeMarks(props.text, props.marks);
+    if (!marks.length) return [{ text: props.text, mark: null as WordMark | null }];
+    const result: Array<{ text: string; mark: WordMark | null }> = [];
+    let cursor = 0;
+    for (const mark of marks) {
+      if (mark.start > cursor) result.push({ text: props.text.slice(cursor, mark.start), mark: null });
+      result.push({ text: props.text.slice(mark.start, mark.end), mark });
+      cursor = mark.end;
+    }
+    if (cursor < props.text.length) result.push({ text: props.text.slice(cursor), mark: null });
+    return result;
+  });
+  return (
+    <>
+      <For each={pieces()}>
+        {(piece) =>
+          piece.mark ? (
+            <mark class={`word-mark wc${piece.mark.confidence}`} title={WORD_CONF_TITLES[piece.mark.confidence]}>
+              {piece.text}
+            </mark>
+          ) : (
+            piece.text
+          )
+        }
+      </For>
+    </>
+  );
+}
 
 function statusText(status: "saved" | "saving" | "offline") {
   if (status === "saving") return "正在保存";
@@ -31,6 +136,23 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
   const srtPattern = /(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})/;
   const bracketPattern = /^\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?\s*[-–]?\s*(.*)$/;
 
+  const makeSegment = (start: number, end: number, rawText: string): Segment => {
+    const speakerName = rawText.match(/^([^：:]{1,10})[：:]/)?.[1];
+    return {
+      id: uid("seg"),
+      start,
+      end,
+      speakerId: speakerName ? "sp-custom" : "sp-interviewer",
+      text: rawText.replace(/^[^：:]{1,10}[：:]\s*/, ""),
+      confidence: 3,
+      reviewed: false,
+      flags: { lowConfidence: false, dialect: false, properNoun: false },
+      wordMarks: [],
+      tagIds: [],
+      comments: [],
+    };
+  };
+
   for (const rawBlock of blocks) {
     const lines = rawBlock.split("\n").map((line) => line.trim()).filter(Boolean);
     if (!lines.length) continue;
@@ -38,19 +160,7 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
     if (srtIndex >= 0) {
       const match = srtPattern.exec(lines[srtIndex]);
       const text = lines.slice(srtIndex + 1).join(" ");
-      const speakerName = text.match(/^([^：:]{1,10})[：:]/)?.[1];
-      segments.push({
-        id: uid("seg"),
-        start: parseTime(match?.[1] ?? "0"),
-        end: parseTime(match?.[2] ?? "1"),
-        speakerId: speakerName ? "sp-custom" : "sp-interviewer",
-        text: text.replace(/^[^：:]{1,10}[：:]\s*/, ""),
-        confidence: 3,
-        reviewed: false,
-        flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
-        comments: [],
-      });
+      segments.push(makeSegment(parseTime(match?.[1] ?? "0"), parseTime(match?.[2] ?? "1"), text));
       continue;
     }
     for (const line of lines) {
@@ -58,36 +168,13 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
       if (!match) continue;
       const start = parseTime(match[1]);
       const text = match[2];
-      const speakerName = text.match(/^([^：:]{1,10})[：:]/)?.[1];
-      segments.push({
-        id: uid("seg"),
-        start,
-        end: start + Math.max(3, text.length / 5),
-        speakerId: speakerName ? "sp-custom" : "sp-interviewer",
-        text: text.replace(/^[^：:]{1,10}[：:]\s*/, ""),
-        confidence: 3,
-        reviewed: false,
-        flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
-        comments: [],
-      });
+      segments.push(makeSegment(start, start + Math.max(3, text.length / 5), text));
     }
   }
 
   if (!segments.length && input.trim()) {
     input.split("\n").map((line) => line.trim()).filter(Boolean).forEach((text, index) => {
-      segments.push({
-        id: uid("seg"),
-        start: index * 6,
-        end: index * 6 + 5.4,
-        speakerId: "sp-interviewer",
-        text,
-        confidence: 3,
-        reviewed: false,
-        flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
-        comments: [],
-      });
+      segments.push(makeSegment(index * 6, index * 6 + 5.4, text));
     });
   }
 
@@ -115,6 +202,8 @@ export default function OralHistoryEditor() {
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
   const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
+  const [selRange, setSelRange] = createSignal<{ start: number; end: number } | null>(null);
+  const [markNotices, setMarkNotices] = createSignal<Record<string, string>>({});
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
@@ -127,16 +216,35 @@ export default function OralHistoryEditor() {
     return data.tracks.find((track) => track.id === data.activeTrackId) ?? data.tracks[0];
   });
   const activeSegment = createMemo(() => activeTrack()?.segments.find((item) => item.id === selectedId()) ?? null);
+  const otherTracks = createMemo(() => project().tracks.filter((track) => track.id !== activeTrack()?.id));
   const visibleSegments = createMemo(() => {
     const segments = activeTrack()?.segments ?? [];
     if (trackFilter() === "unreviewed") return segments.filter((segment) => !segment.reviewed);
-    if (trackFilter() === "low") return segments.filter((segment) => segment.confidence <= 2 || segment.flags.lowConfidence);
+    if (trackFilter() === "low") return segments.filter((segment) => hasLowWord(segment));
     return segments;
   });
   const completedPercent = createMemo(() => {
     const segments = project().tracks.flatMap((track) => track.segments);
     if (!segments.length) return 0;
     return Math.round((segments.filter((segment) => segment.reviewed).length / segments.length) * 100);
+  });
+  const wordStats = createMemo(() => projectWordStats(project().tracks));
+  const wordPercent = createMemo(() => {
+    const stats = wordStats();
+    return stats.total ? Math.round((stats.marked / stats.total) * 100) : 0;
+  });
+  const reviewedCount = createMemo(
+    () => project().tracks.flatMap((track) => track.segments).filter((segment) => segment.reviewed).length,
+  );
+  const totalCount = createMemo(() => project().tracks.flatMap((track) => track.segments).length);
+  const backfillNotes = createMemo(() => project().backfillNotes ?? []);
+  const selectedTokens = createMemo(() => {
+    const segment = activeSegment();
+    const range = selRange();
+    if (!segment || !range || range.end <= range.start) return [];
+    return tokenize(segment.text).filter(
+      (word) => word.end > range.start && word.start < range.end,
+    );
   });
   const speakerById = (speakerId: string) =>
     project().speakers.find((speaker) => speaker.id === speakerId) ?? project().speakers[0];
@@ -195,6 +303,7 @@ export default function OralHistoryEditor() {
       draft.activeTrackId = trackId;
       selectedIdSet(draft.tracks.find((track) => track.id === trackId)?.segments[0]?.id ?? "");
     });
+    setSelRange(null);
   };
 
   const selectedIdSet = (id: string) => setSelectedId(id);
@@ -208,35 +317,58 @@ export default function OralHistoryEditor() {
     document.getElementById(`segment-${segments[nextIndex].id}`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   };
 
+  const setMarkNotice = (segmentId: string, message: string) => {
+    setMarkNotices((items) => ({ ...items, [segmentId]: message }));
+  };
+
+  const describeDropped = (text: string, dropped: WordMark[]) => {
+    const words = dropped
+      .map((mark) => `“${text.slice(mark.start, mark.end)}”`)
+      .filter((word) => word.trim().length > 2);
+    return words.length ? `以下词标记未能保留：${words.join("、")}，请重新标注。` : "部分词标记已失效，请重新标注。";
+  };
+
   const splitSelection = () => {
     const segment = activeSegment();
     if (!segment || segment.text.trim().length < 2) return;
     const cursor = editorRef?.selectionStart ?? Math.floor(segment.text.length / 2);
     const safeCursor = Math.max(1, Math.min(cursor, segment.text.length - 1));
-    const firstText = segment.text.slice(0, safeCursor).trim();
-    const secondText = segment.text.slice(safeCursor).trim();
+    const firstTextRaw = segment.text.slice(0, safeCursor);
+    const secondTextRaw = segment.text.slice(safeCursor);
+    const firstText = firstTextRaw.trim();
+    const secondText = secondTextRaw.trim();
     if (!firstText || !secondText) return;
-    const ratio = firstText.length / segment.text.length;
+    const ratio = firstTextRaw.length / segment.text.length;
     const boundary = segment.start + (segment.end - segment.start) * ratio;
+    // 词标记留在原来那几个字上：按拆分点裁剪，分别跟随两侧。
+    const split = splitWordMarks(segment.text, safeCursor, segment.wordMarks);
     const secondId = uid("seg");
-    commitSegment("拆分片段", (current, draft) => {
-      const original = structuredClone(current);
-      current.text = firstText;
-      current.end = Number(boundary.toFixed(1));
+    commit("拆分片段", (draft) => {
       const trackIndex = draft.tracks.findIndex((track) => track.id === draft.activeTrackId);
-      if (trackIndex >= 0) {
-        const segmentIndex = draft.tracks[trackIndex].segments.findIndex((item) => item.id === current.id);
-        draft.tracks[trackIndex].segments.splice(segmentIndex + 1, 0, {
-          ...original,
-          id: secondId,
-          start: Number(boundary.toFixed(1)),
-          text: secondText,
-          reviewed: false,
-          comments: [],
-        });
-      }
+      if (trackIndex < 0) return;
+      const track = draft.tracks[trackIndex];
+      const current = track.segments.find((item) => item.id === segment.id);
+      if (!current) return;
+      current.text = split.firstText;
+      current.end = Number(boundary.toFixed(1));
+      current.wordMarks = split.first;
+      current.flags.lowConfidence = hasLowWord(current);
+      const created: Segment = {
+        ...structuredClone(current),
+        id: secondId,
+        start: Number(boundary.toFixed(1)),
+        text: split.secondText,
+        wordMarks: split.second,
+        reviewed: false,
+        comments: [],
+      };
+      created.flags.lowConfidence = hasLowWord(created);
+      track.segments.splice(track.segments.indexOf(current) + 1, 0, created);
       setSelectedId(secondId);
     });
+    if (split.dropped.length) {
+      setMarkNotice(secondId, describeDropped(segment.text, split.dropped));
+    }
   };
 
   const mergeWithNext = () => {
@@ -246,30 +378,131 @@ export default function OralHistoryEditor() {
     const index = track.segments.findIndex((item) => item.id === segment.id);
     const next = track.segments[index + 1];
     if (!next) return;
+    // 合并时两侧词标记按“原来那几个字”整体平移、重锚。
+    const merged = mergeWordMarks(segment.text, segment.wordMarks, next.text, next.wordMarks);
+    const mergedBase = Math.min(segment.confidence, next.confidence) as Confidence;
     commitSegment("合并下一片段", (current, draft) => {
-      current.text = `${current.text.trim()} ${next.text.trim()}`;
-      current.end = next.end;
-      current.tagIds = [...new Set([...current.tagIds, ...next.tagIds])];
-      current.comments.push(...next.comments);
-      current.confidence = Math.min(current.confidence, next.confidence) as Confidence;
       const sourceTrack = draft.tracks.find((item) => item.id === draft.activeTrackId);
-      sourceTrack?.segments.splice(index + 1, 1);
+      if (!sourceTrack) return;
+      current.text = merged.text;
+      current.end = next.end;
+      current.wordMarks = merged.marks;
+      current.confidence = mergedBase;
+      current.flags.lowConfidence = hasLowWord(current);
+      current.tagIds = [...new Set([...current.tagIds, ...next.tagIds])];
+      current.comments.push(...structuredClone(next.comments));
+      sourceTrack.segments.splice(index + 1, 1);
       current.reviewed = false;
     });
+    if (merged.dropped.length) setMarkNotice(segment.id, describeDropped(`${segment.text} ${next.text}`, merged.dropped));
   };
 
-  const toggleFlag = (flag: keyof Segment["flags"]) => {
+  const toggleFlag = (flag: keyof Omit<Segment["flags"], "lowConfidence">) => {
     commitSegment("修改校对标记", (segment) => {
       segment.flags[flag] = !segment.flags[flag];
       segment.reviewed = false;
     });
   };
 
-  const setConfidence = (confidence: Confidence) => {
-    commitSegment("校正置信度", (segment) => {
+  /** 设置整段基准置信度（没有选词时）。 */
+  const setBaseConfidence = (confidence: Confidence) => {
+    commitSegment("校正整段基准置信度", (segment) => {
       segment.confidence = confidence;
-      segment.flags.lowConfidence = confidence <= 2;
+      segment.flags.lowConfidence = hasLowWord(segment);
       segment.reviewed = false;
+    });
+  };
+
+  /** 清除当前片段的全部词标记，恢复为整段基准。 */
+  const clearWordMarks = () => {
+    commitSegment("清除词级标记", (segment) => {
+      segment.wordMarks = [];
+      segment.flags.lowConfidence = false;
+      segment.reviewed = false;
+    });
+    setMarkNotices((items) => {
+      const next = { ...items };
+      delete next[selectedId()];
+      return next;
+    });
+  };
+
+  /** 删除某个词标记。 */
+  const removeWordMark = (mark: WordMark) => {
+    commitSegment("删除词级标记", (segment) => {
+      segment.wordMarks = normalizeMarks(segment.text, segment.wordMarks).filter(
+        (item) => !(item.start === mark.start && item.end === mark.end),
+      );
+      segment.flags.lowConfidence = hasLowWord(segment);
+      segment.reviewed = false;
+    });
+  };
+
+  /** 修改某个词标记的置信级别。 */
+  const setWordMarkConfidence = (mark: WordMark, confidence: Confidence) => {
+    commitSegment("校正词级置信度", (segment) => {
+      segment.wordMarks = normalizeMarks(segment.text, segment.wordMarks).map((item) =>
+        item.start === mark.start && item.end === mark.end ? { ...item, confidence } : item,
+      );
+      segment.flags.lowConfidence = hasLowWord(segment);
+      segment.reviewed = false;
+    });
+  };
+
+  /** 给文本框当前选中的字词打置信级别；覆盖与选区相交的旧标记。 */
+  const markSelection = (confidence: Confidence) => {
+    const segment = activeSegment();
+    const range = selRange();
+    if (!segment || !range) return;
+    const tokens = tokenize(segment.text).filter(
+      (word) => word.end > range.start && word.start < range.end,
+    );
+    if (!tokens) return;
+    commitSegment("标记词级置信度", (item) => {
+      const from = tokens[0].start;
+      const to = tokens[tokens.length - 1].end;
+      const kept = normalizeMarks(item.text, item.wordMarks).filter(
+        (mark) => mark.end <= from || mark.start >= to,
+      );
+      item.wordMarks = normalizeMarks(item.text, [...kept, { start: from, end: to, confidence }]);
+      item.flags.lowConfidence = hasLowWord(item);
+      item.reviewed = false;
+    });
+  };
+
+  /**
+   * 改正文：先按旧文本把词标记重锚到新文本。
+   * 整段重录或原词找不到 → 标记失效并说明，不硬贴旧位置。
+   */
+  const editText = (nextText: string) => {
+    const segment = activeSegment();
+    if (!segment) return;
+    const oldText = segment.text;
+    const result = rebaseWordMarks(oldText, nextText, segment.wordMarks);
+    commitSegment("校正转写文本", (item) => {
+      item.text = nextText;
+      item.wordMarks = result.marks;
+      item.flags.lowConfidence = hasLowWord(item);
+      item.reviewed = false;
+    });
+    if (result.reRecorded) {
+      setMarkNotice(segment.id, "整段文字与原录音稿差异过大，已按重新录写处理，原有的词标记全部失效，请重新标注。");
+    } else if (result.dropped.length) {
+      setMarkNotice(segment.id, describeDropped(oldText, result.dropped));
+    }
+  };
+
+  const dismissBackfillNote = (noteId: string) => {
+    commit("确认回填说明", (draft) => {
+      draft.backfillNotes = (draft.backfillNotes ?? []).filter((note) => note.id !== noteId);
+    });
+  };
+
+  const dismissMarkNotice = (segmentId: string) => {
+    setMarkNotices((items) => {
+      const next = { ...items };
+      delete next[segmentId];
+      return next;
     });
   };
 
@@ -449,6 +682,7 @@ export default function OralHistoryEditor() {
 
   const clickSegment = (id: string) => {
     setSelectedId(id);
+    setSelRange(null);
     queueMicrotask(() => editorRef?.focus());
   };
 
@@ -469,6 +703,29 @@ export default function OralHistoryEditor() {
             </div>
           </div>
         )}
+      </Show>
+
+      <Show when={backfillNotes().length}>
+        <div class="backfill-banner">
+          <div class="backfill-head">
+            <strong>旧稿词级回填说明</strong>
+            <span>已把旧的整段置信度按原级别回填到每个字词；以下 {backfillNotes().length} 个片段回填失败，保持原样。</span>
+          </div>
+          <ul class="backfill-list">
+            <For each={backfillNotes()}>
+              {(note) => (
+                <li>
+                  <div>
+                    <b>《{note.trackName}》片段</b>
+                    <code>{note.preview}</code>
+                  </div>
+                  <span>{note.reason}</span>
+                  <button class="btn btn-quiet" onClick={() => dismissBackfillNote(note.id)}>知道了</button>
+                </li>
+              )}
+            </For>
+          </ul>
+        </div>
       </Show>
 
       <header class="topbar">
@@ -500,10 +757,15 @@ export default function OralHistoryEditor() {
             <div class="eyebrow">校对进度</div>
             <div class="progress-row">
               <strong>{completedPercent()}%</strong>
-              <span>{project().tracks.flatMap((track) => track.segments).filter((segment) => segment.reviewed).length} / {project().tracks.flatMap((track) => track.segments).length} 片段</span>
+              <span>{reviewedCount()} / {totalCount()} 片段</span>
             </div>
             <div class="progress-track"><i style={{ width: `${completedPercent()}%` }} /></div>
-            <p>修改会自动保存在本机；断网后仍可继续校对。</p>
+            <div class="progress-row word-progress-row">
+              <span class="word-progress-label">词级标记</span>
+              <span>{wordStats().marked} / {wordStats().total} 字词 · {wordPercent()}%</span>
+            </div>
+            <div class="progress-track word-progress-track"><i style={{ width: `${wordPercent()}%` }} /></div>
+            <p>标记一改动，片段综合置信度和校对进度会立即重算；修改自动保存在本机，断网后仍可继续校对。</p>
           </section>
 
           <section class="panel-section">
@@ -576,13 +838,16 @@ export default function OralHistoryEditor() {
                   <div class="segment-body">
                     <div class="segment-meta">
                       <b>{speakerById(segment.speakerId)?.name ?? "未知发言人"}</b>
-                      <span class={`confidence c${segment.confidence}`}>置信 {segment.confidence}/5</span>
-                      <Show when={segment.flags.lowConfidence}><span class="pill alert">低置信</span></Show>
+                      <span class={`confidence c${effectiveConfidence(segment)}`}>综合置信 {effectiveConfidence(segment)}/5</span>
+                      <Show when={minWordConfidence(segment) !== null}>
+                        <span class={`confidence c${minWordConfidence(segment) ?? 3}`}>最低词 {minWordConfidence(segment)}/5</span>
+                      </Show>
+                      <Show when={hasLowWord(segment)}><span class="pill alert">低置信词</span></Show>
                       <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
                       <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
                       <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
                     </div>
-                    <p>{segment.text}</p>
+                    <p><MarkedText text={segment.text} marks={segment.wordMarks ?? []} /></p>
                     <div class="segment-tags">
                       <For each={segment.tagIds.map(tagById).filter(Boolean)}>
                         {(tag) => <span style={{ "--tag-color": tag!.color } as any}>#{tag!.label}</span>}
@@ -605,6 +870,7 @@ export default function OralHistoryEditor() {
               <Tabs defaultValue="correct" class="inspector-tabs">
                 <Tabs.List class="tab-list">
                   <Tabs.Trigger value="correct">校对</Tabs.Trigger>
+                  <Tabs.Trigger value="align">跨轨对齐</Tabs.Trigger>
                   <Tabs.Trigger value="annotate">标注</Tabs.Trigger>
                   <Tabs.Trigger value="comments">批注 <span>{segment().comments.length}</span></Tabs.Trigger>
                 </Tabs.List>
@@ -637,24 +903,111 @@ export default function OralHistoryEditor() {
                     ref={editorRef}
                     rows="7"
                     value={segment().text}
-                    onChange={(event) => commitSegment("校正转写文本", (item) => { item.text = event.currentTarget.value; item.reviewed = false; })}
+                    onSelect={(event) => {
+                      const el = event.currentTarget;
+                      if (el.selectionEnd > el.selectionStart) {
+                        setSelRange({ start: el.selectionStart, end: el.selectionEnd });
+                      } else {
+                        setSelRange(null);
+                      }
+                    }}
+                    onKeyUp={(event) => {
+                      const el = event.currentTarget;
+                      setSelRange(el.selectionEnd > el.selectionStart
+                        ? { start: el.selectionStart, end: el.selectionEnd }
+                        : null);
+                    }}
+                    onClick={(event) => {
+                      const el = event.currentTarget;
+                      setSelRange(el.selectionEnd > el.selectionStart
+                        ? { start: el.selectionStart, end: el.selectionEnd }
+                        : null);
+                    }}
+                    onChange={(event) => {
+                      setSelRange(null);
+                      editText(event.currentTarget.value);
+                    }}
                   />
-                  <div class="textarea-help">光标停在句中后点击“拆分”，系统会保留两侧时间码比例。</div>
+                  <Show when={markNotices()[segment().id]}>
+                    <div class="mark-notice" role="alert">
+                      <span>{markNotices()[segment().id]}</span>
+                      <button onClick={() => dismissMarkNotice(segment().id)} aria-label="关闭提示">×</button>
+                    </div>
+                  </Show>
+                  <div class="textarea-help">在文本里选中一个或几个字词，再点下方级别即可单独标记；光标拆分后词标记跟着原来的字走，整段重录则标记失效。</div>
 
-                  <div class="field-label">置信度</div>
+                  <div class="field-label">
+                    {selectedTokens().length
+                      ? `选中词标记（${selectedTokens().map((word) => word.text).join("")}）`
+                      : "整段基准置信度"}
+                  </div>
                   <div class="confidence-picker" role="radiogroup" aria-label="置信度">
                     <For each={[1, 2, 3, 4, 5] as Confidence[]}>
-                      {(value) => <button class={segment().confidence === value ? "active" : ""} onClick={() => setConfidence(value)}>{value}</button>}
+                      {(value) => (
+                        <button
+                          class={`wc${value} ${!selectedTokens().length && segment().confidence === value ? "active" : ""}`}
+                          title={selectedTokens().length
+                            ? `把选中字词标为 ${value} 级`
+                            : "没有选词时设置整段基准置信度"}
+                          onClick={() => (selectedTokens().length ? markSelection(value) : setBaseConfidence(value))}
+                        >
+                          {value}
+                        </button>
+                      )}
                     </For>
                   </div>
+                  <div class="confidence-summary">
+                    <span class={`confidence c${effectiveConfidence(segment())}`}>综合 {effectiveConfidence(segment())}/5</span>
+                    <Show when={minWordConfidence(segment()) !== null}>
+                      <span class={`confidence c${minWordConfidence(segment()) ?? 3}`}>最低词 {minWordConfidence(segment())}/5</span>
+                    </Show>
+                    <span class="confidence-hint">综合值随词标记即时重算</span>
+                  </div>
+
+                  <div class="field-label">
+                    词级标记
+                    <Show when={normalizeMarks(segment().text, segment().wordMarks).length}>
+                      <button class="inline-link" onClick={clearWordMarks}>全部清除</button>
+                    </Show>
+                  </div>
+                  <Show
+                    when={normalizeMarks(segment().text, segment().wordMarks).length}
+                    fallback={<div class="mini-empty">还没有词级标记。在上面文本里选中听不准的字词即可单独标记。</div>}
+                  >
+                    <ul class="word-chip-list">
+                      <For each={normalizeMarks(segment().text, segment().wordMarks)}>
+                        {(mark) => (
+                          <li class={`word-chip wc${mark.confidence}`}>
+                            <span class="word-chip-text">{segment().text.slice(mark.start, mark.end)}</span>
+                            <span class="word-chip-levels">
+                              <For each={[1, 2, 3, 4, 5] as Confidence[]}>
+                                {(value) => (
+                                  <button
+                                    class={mark.confidence === value ? "on" : ""}
+                                    title={WORD_CONF_TITLES[value]}
+                                    onClick={() => setWordMarkConfidence(mark, value)}
+                                  >
+                                    {value}
+                                  </button>
+                                )}
+                              </For>
+                            </span>
+                            <button class="word-chip-remove" title="删除该标记" onClick={() => removeWordMark(mark)}>×</button>
+                          </li>
+                        )}
+                      </For>
+                    </ul>
+                  </Show>
 
                   <div class="field-label">校对标记</div>
                   <div class="flag-list">
-                    <Checkbox checked={segment().flags.lowConfidence} onChange={() => toggleFlag("lowConfidence")} class="flag-row">
-                      <Checkbox.Input />
-                      <Checkbox.Control><Checkbox.Indicator>✓</Checkbox.Indicator></Checkbox.Control>
-                      <Checkbox.Label>低置信词或句</Checkbox.Label>
-                    </Checkbox>
+                    <div class="flag-row flag-derived">
+                      <Checkbox checked={hasLowWord(segment())} disabled class="flag-row">
+                        <Checkbox.Input />
+                        <Checkbox.Control><Checkbox.Indicator>✓</Checkbox.Indicator></Checkbox.Control>
+                        <Checkbox.Label>低置信词（由 ≤2 级的词标记自动派生）</Checkbox.Label>
+                      </Checkbox>
+                    </div>
                     <Checkbox checked={segment().flags.dialect} onChange={() => toggleFlag("dialect")} class="flag-row">
                       <Checkbox.Input />
                       <Checkbox.Control><Checkbox.Indicator>✓</Checkbox.Indicator></Checkbox.Control>
@@ -671,6 +1024,13 @@ export default function OralHistoryEditor() {
                     <button onClick={splitSelection}>⌁ 按光标拆分</button>
                     <button disabled={activeTrack().segments.at(-1)?.id === segment().id} onClick={mergeWithNext}>合 合并下一段</button>
                   </div>
+                </Tabs.Content>
+
+                <Tabs.Content value="align" class="tab-content align-content">
+                  <AlignmentPanel
+                    segment={segment()}
+                    tracks={otherTracks()}
+                  />
                 </Tabs.Content>
 
                 <Tabs.Content value="annotate" class="tab-content">

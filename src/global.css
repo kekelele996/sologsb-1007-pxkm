@@ -122,8 +122,84 @@ kbd { padding: 2px 5px; border: 1px solid rgba(0,0,0,.15); border-bottom-width: 
 .empty-state { display: grid; place-items: center; gap: 6px; height: 160px; color: #7d858b; border: 1px dashed #d5d6d2; border-radius: 12px; }
 .empty-state span { font-size: 12px; }
 
+/* 词级置信标记 */
+.word-mark { color: inherit; border-radius: 3px; padding: 0 1px; }
+.word-mark.wc1 { background: #fecac3; box-shadow: inset 0 -2px 0 #c2311f; }
+.word-mark.wc2 { background: #ffe0c0; box-shadow: inset 0 -2px 0 #d9730d; }
+.word-mark.wc3 { background: #fdeeb8; box-shadow: inset 0 -2px 0 #b98a16; }
+.word-mark.wc4 { background: #d3ecff; box-shadow: inset 0 -2px 0 #3b82c4; }
+.word-mark.wc5 { background: #cdeeda; box-shadow: inset 0 -2px 0 #2f9e66; }
+.word-progress-row { margin-top: 10px; }
+.word-progress-label { color: #4d5961; font-weight: 650; }
+.word-progress-track { height: 5px; background: #e3ddcd; }
+.word-progress-track i { background: linear-gradient(90deg, #c2732f, #e2a758); }
+
+/* 旧稿回填说明 */
+.backfill-banner { padding: 10px 20px; color: #4a3511; background: #fdf6e3; border-bottom: 1px solid #ecd9a4; }
+.backfill-head strong { font-size: 13px; margin-right: 8px; }
+.backfill-head span { font-size: 12px; color: #7d6531; }
+.backfill-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; }
+.backfill-list li { display: grid; grid-template-columns: minmax(220px, 1fr) 2fr auto; gap: 12px; align-items: center; background: #fffaf0; border: 1px solid #eee0bd; border-radius: 8px; padding: 7px 10px; font-size: 11px; }
+.backfill-list b { font-size: 11px; margin-right: 8px; }
+.backfill-list code { font: 11px ui-monospace, monospace; background: rgba(0,0,0,.05); padding: 2px 6px; border-radius: 4px; }
+.backfill-list span { color: #7a6432; line-height: 1.45; }
+.backfill-list .btn { padding: 5px 10px; font-size: 11px; }
+
+/* 校对页：词标记编辑 */
+.mark-notice { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-top: 7px; padding: 8px 10px; border-radius: 8px; background: #fdeee3; border: 1px solid #f0c8a4; color: #8a4a17; font-size: 11px; line-height: 1.5; }
+.mark-notice button { border: 0; background: transparent; color: #a35a1f; font-size: 15px; line-height: 1; cursor: pointer; padding: 0 2px; }
+.confidence-picker button.wc1 { color: #c2311f; }
+.confidence-picker button.wc2 { color: #d9730d; }
+.confidence-picker button.wc3 { color: #b98a16; }
+.confidence-picker button.wc4 { color: #2f73b0; }
+.confidence-picker button.wc5 { color: #2f9e66; }
+.confidence-picker button.active { color: #fff; }
+.confidence-picker button.wc1.active { background: #c2311f; border-color: #c2311f; }
+.confidence-picker button.wc2.active { background: #d9730d; border-color: #d9730d; }
+.confidence-picker button.wc3.active { background: #b98a16; border-color: #b98a16; }
+.confidence-picker button.wc4.active { background: #2f73b0; border-color: #2f73b0; }
+.confidence-picker button.wc5.active { background: #2f9e66; border-color: #2f9e66; }
+.confidence-summary { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 7px; }
+.confidence-hint { font-size: 10px; color: #98a0a6; }
+.inline-link { border: 0; background: transparent; color: #28609d; font-size: 10px; font-weight: 650; cursor: pointer; margin-left: 8px; padding: 0; }
+.word-chip-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.word-chip { display: grid; grid-template-columns: minmax(56px, 1fr) auto auto; gap: 8px; align-items: center; border: 1px solid #e0ded5; border-radius: 8px; padding: 5px 8px; background: #fff; }
+.word-chip.wc1 { border-left: 4px solid #c2311f; }
+.word-chip.wc2 { border-left: 4px solid #d9730d; }
+.word-chip.wc3 { border-left: 4px solid #b98a16; }
+.word-chip.wc4 { border-left: 4px solid #3b82c4; }
+.word-chip.wc5 { border-left: 4px solid #2f9e66; }
+.word-chip-text { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.word-chip-levels { display: flex; gap: 2px; }
+.word-chip-levels button { width: 20px; height: 20px; border: 1px solid #d3d5d4; border-radius: 4px; background: #fff; font-size: 10px; cursor: pointer; padding: 0; color: #889096; }
+.word-chip-levels button.on { background: #1f5fbf; border-color: #1f5fbf; color: #fff; }
+.word-chip-remove { width: 20px; height: 20px; border: 0; border-radius: 4px; background: transparent; color: #a3544b; cursor: pointer; font-size: 13px; }
+.flag-derived { opacity: .85; }
+
+/* 跨轨对齐 */
+.align-content select { margin-bottom: 4px; }
+.align-summary { border-radius: 8px; padding: 8px 10px; font-size: 11px; margin: 12px 0 10px; }
+.align-summary.all-aligned { background: #e9f7ef; color: #16613f; border: 1px solid #bfe5cf; }
+.align-summary.has-mismatch { background: #fdeee3; color: #94480f; border: 1px solid #f0c8a4; }
+.align-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 7px; }
+.align-list li { border-radius: 8px; padding: 8px 10px; border: 1px solid #e3e1d8; background: #fff; }
+.align-list li.aligned { border-left: 4px solid #2f9e66; }
+.align-list li.mismatched { border-left: 4px solid #d23c28; background: #fff8f6; }
+.align-word-row { display: flex; align-items: center; gap: 8px; }
+.align-chip { border-radius: 4px; padding: 1px 6px; font-size: 12px; font-weight: 650; }
+.align-chip.wc1 { background: #fecac3; }
+.align-chip.wc2 { background: #ffe0c0; }
+.align-chip.wc3 { background: #fdeeb8; }
+.align-chip.wc4 { background: #d3ecff; }
+.align-chip.wc5 { background: #cdeeda; }
+.align-time { font: 10px ui-monospace, monospace; color: #7e8890; }
+.align-status { margin-left: auto; font-size: 10px; font-weight: 700; }
+.align-list li.aligned .align-status { color: #1d7a4c; }
+.align-list li.mismatched .align-status { color: #c2311f; }
+.align-list li p { margin: 5px 0 0; font-size: 10px; line-height: 1.5; color: #6d7780; }
+
 .inspector-tabs { min-height: 100%; }
-.tab-list { position: sticky; top: 0; z-index: 5; display: grid; grid-template-columns: repeat(3, 1fr); background: #eeece6; border-bottom: 1px solid var(--line); }
+.tab-list { position: sticky; top: 0; z-index: 5; display: grid; grid-template-columns: repeat(4, 1fr); background: #eeece6; border-bottom: 1px solid var(--line); }
 .tab-list [role="tab"] { border: 0; background: transparent; color: #657078; padding: 15px 6px 13px; cursor: pointer; border-bottom: 3px solid transparent; font-size: 12px; }
 .tab-list [role="tab"][data-selected] { color: #173f74; font-weight: 750; background: #fbfaf6; border-bottom-color: #1f5fbf; }
 .tab-list [role="tab"] span { background: #dce5f3; border-radius: 99px; padding: 1px 5px; font-size: 10px; }
